@@ -59,4 +59,4 @@ jobs:
       with:
         name: aseprite
         path: |
-          D:/dev/aseprite.exe
+          data/aseprite.exe
