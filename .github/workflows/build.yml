@@ -59,5 +59,4 @@ jobs:
       with:
         name: aseprite
         path: |
-          D:/a/domyson/aseprite/build/bin/data
-          D:/a/domyson/aseprite/build/bin/aseprite.exe
+          ./aseprite.exe
