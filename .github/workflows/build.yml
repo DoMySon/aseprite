@@ -59,4 +59,4 @@ jobs:
       with:
         name: aseprite.exe
         path: |
-          ${{ env.GITHUB_WORKSPACE }}
+          /mingw64/bin/aseprite.exe
