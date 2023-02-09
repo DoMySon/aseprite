@@ -59,4 +59,4 @@ jobs:
       with:
         name: aseprite.exe
         path: |
-          build/aseprite.exe
+          ${{ env.GITHUB_WORKSPACE }}
