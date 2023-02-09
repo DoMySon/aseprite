@@ -15,6 +15,12 @@ jobs:
             enable_ui: on
     steps:
     - uses: actions/checkout@v2
+    
+    - name: display
+      run: echo $PATH
+      shell: bash
+    
+    - uses: actions/checkout@v2
       with:
         submodules: 'recursive'
     - name: ccache
