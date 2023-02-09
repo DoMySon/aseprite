@@ -57,6 +57,7 @@ jobs:
         cd build && ninja
     - uses: actions/upload-artifact@v3
       with:
-        name: aseprite.exe
+        name: aseprite
         path: |
-          /mingw64/bin/aseprite.exe
+          D:/proj1/aseprite/build/bin/data
+          D:/proj1/aseprite/build/bin/aseprite.exe
