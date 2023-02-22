@@ -14,11 +14,11 @@
 #include "app/file/file.h"
 #include "app/file/file_format.h"
 #include "app/file/format_options.h"
-#include "app/pref/preferences.h"
 #include "base/cfile.h"
 #include "base/exception.h"
 #include "base/file_handle.h"
 #include "base/fs.h"
+#include "base/mem_utils.h"
 #include "dio/aseprite_common.h"
 #include "dio/aseprite_decoder.h"
 #include "dio/decode_delegate.h"
@@ -33,6 +33,8 @@
 #include <cstdio>
 #include <deque>
 #include <variant>
+
+#define ASEFILE_TRACE(...) // TRACE(__VA_ARGS__)
 
 namespace app {
 
@@ -65,7 +67,7 @@ public:
   }
 
   doc::color_t defaultSliceColor() override {
-    auto color = Preferences::instance().slices.defaultColor();
+    auto color = m_fop->config().defaultSliceColor;
     return doc::rgba(color.getRed(),
                      color.getGreen(),
                      color.getBlue(),
@@ -78,6 +80,10 @@ public:
 
   doc::Sprite* sprite() { return m_sprite; }
 
+  bool cacheCompressedTilesets() const {
+    return m_fop->config().cacheCompressedTilesets;
+  }
+
 private:
   FileOp* m_fop;
   doc::Sprite* m_sprite;
@@ -86,25 +92,25 @@ private:
 class ScanlinesGen {
 public:
   virtual ~ScanlinesGen() { }
-  virtual gfx::Size getImageSize() = 0;
-  virtual int getScanlineSize() = 0;
-  virtual const uint8_t* getScanlineAddress(int y) = 0;
+  virtual gfx::Size getImageSize() const = 0;
+  virtual int getScanlineSize() const = 0;
+  virtual const uint8_t* getScanlineAddress(int y) const = 0;
 };
 
 class ImageScanlines : public ScanlinesGen {
   const Image* m_image;
 public:
   ImageScanlines(const Image* image) : m_image(image) { }
-  gfx::Size getImageSize() override {
+  gfx::Size getImageSize() const override {
     return gfx::Size(m_image->width(),
                      m_image->height());
   }
-  int getScanlineSize() override {
+  int getScanlineSize() const override {
     return doc::calculate_rowstride_bytes(
       m_image->pixelFormat(),
       m_image->width());
   }
-  const uint8_t* getScanlineAddress(int y) override {
+  const uint8_t* getScanlineAddress(int y) const override {
     return m_image->getPixelAddress(0, y);
   }
 };
@@ -113,16 +119,16 @@ class TilesetScanlines : public ScanlinesGen {
   const Tileset* m_tileset;
 public:
   TilesetScanlines(const Tileset* tileset) : m_tileset(tileset) { }
-  gfx::Size getImageSize() override {
+  gfx::Size getImageSize() const override {
     return gfx::Size(m_tileset->grid().tileSize().w,
                      m_tileset->grid().tileSize().h * m_tileset->size());
   }
-  int getScanlineSize() override {
+  int getScanlineSize() const override {
     return doc::calculate_rowstride_bytes(
       m_tileset->sprite()->pixelFormat(),
       m_tileset->grid().tileSize().w);
   }
-  const uint8_t* getScanlineAddress(int y) override {
+  const uint8_t* getScanlineAddress(int y) const override {
     const int h = m_tileset->grid().tileSize().h;
     const tile_index ti = (y / h);
     ASSERT(ti >= 0 && ti < m_tileset->size());
@@ -814,14 +820,41 @@ public:
 //////////////////////////////////////////////////////////////////////
 
 template<typename ImageTraits>
-static void write_raw_image(FILE* f, const Image* image)
+static void write_raw_image_templ(FILE* f, const ScanlinesGen* gen)
 {
+  const gfx::Size imgSize = gen->getImageSize();
   PixelIO<ImageTraits> pixel_io;
   int x, y;
 
-  for (y=0; y<image->height(); y++)
-    for (x=0; x<image->width(); x++)
-      pixel_io.write_pixel(f, get_pixel_fast<ImageTraits>(image, x, y));
+  for (y=0; y<imgSize.h; ++y) {
+    typename ImageTraits::address_t address =
+      (typename ImageTraits::address_t)gen->getScanlineAddress(y);
+
+    for (x=0; x<imgSize.w; ++x, ++address)
+      pixel_io.write_pixel(f, *address);
+  }
+}
+
+static void write_raw_image(FILE* f, ScanlinesGen* gen, PixelFormat pixelFormat)
+{
+  switch (pixelFormat) {
+
+    case IMAGE_RGB:
+      write_raw_image_templ<RgbTraits>(f, gen);
+      break;
+
+    case IMAGE_GRAYSCALE:
+      write_raw_image_templ<GrayscaleTraits>(f, gen);
+      break;
+
+    case IMAGE_INDEXED:
+      write_raw_image_templ<IndexedTraits>(f, gen);
+      break;
+
+    case IMAGE_TILEMAP:
+      write_raw_image_templ<TilemapTraits>(f, gen);
+      break;
+  }
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -829,7 +862,9 @@ static void write_raw_image(FILE* f, const Image* image)
 //////////////////////////////////////////////////////////////////////
 
 template<typename ImageTraits>
-static void write_compressed_image_templ(FILE* f, ScanlinesGen* gen)
+static void write_compressed_image_templ(FILE* f,
+                                         ScanlinesGen* gen,
+                                         base::buffer* compressedOutput)
 {
   PixelIO<ImageTraits> pixel_io;
   z_stream zstream;
@@ -870,6 +905,17 @@ static void write_compressed_image_templ(FILE* f, ScanlinesGen* gen)
         if ((fwrite(&compressed[0], 1, output_bytes, f) != (size_t)output_bytes)
             || ferror(f))
           throw base::Exception("Error writing compressed image pixels.\n");
+
+        // Save the whole compressed buffer to re-use in following
+        // save options (so we don't have to re-compress the whole
+        // tileset)
+        if (compressedOutput) {
+          std::size_t n = compressedOutput->size();
+          compressedOutput->resize(n + output_bytes);
+          std::copy(compressed.begin(),
+                    compressed.begin() + output_bytes,
+                    compressedOutput->begin() + n);
+        }
       }
     } while (zstream.avail_out == 0);
   }
@@ -879,23 +925,26 @@ static void write_compressed_image_templ(FILE* f, ScanlinesGen* gen)
     throw base::Exception("ZLib error %d in deflateEnd().", err);
 }
 
-static void write_compressed_image(FILE* f, ScanlinesGen* gen, PixelFormat pixelFormat)
+static void write_compressed_image(FILE* f,
+                                   ScanlinesGen* gen,
+                                   PixelFormat pixelFormat,
+                                   base::buffer* compressedOutput = nullptr)
 {
   switch (pixelFormat) {
     case IMAGE_RGB:
-      write_compressed_image_templ<RgbTraits>(f, gen);
+      write_compressed_image_templ<RgbTraits>(f, gen, compressedOutput);
       break;
 
     case IMAGE_GRAYSCALE:
-      write_compressed_image_templ<GrayscaleTraits>(f, gen);
+      write_compressed_image_templ<GrayscaleTraits>(f, gen, compressedOutput);
       break;
 
     case IMAGE_INDEXED:
-      write_compressed_image_templ<IndexedTraits>(f, gen);
+      write_compressed_image_templ<IndexedTraits>(f, gen, compressedOutput);
       break;
 
     case IMAGE_TILEMAP:
-      write_compressed_image_templ<TilemapTraits>(f, gen);
+      write_compressed_image_templ<TilemapTraits>(f, gen, compressedOutput);
       break;
   }
 }
@@ -950,21 +999,8 @@ static void ase_file_write_cel_chunk(FILE* f, dio::AsepriteFrameHeader* frame_he
         fputw(image->height(), f);
 
         // Pixel data
-        switch (image->pixelFormat()) {
-
-          case IMAGE_RGB:
-            write_raw_image<RgbTraits>(f, image);
-            break;
-
-          case IMAGE_GRAYSCALE:
-            write_raw_image<GrayscaleTraits>(f, image);
-            break;
-
-          case IMAGE_INDEXED:
-            write_raw_image<IndexedTraits>(f, image);
-            break;
-
-        }
+        ImageScanlines scan(image);
+        write_raw_image(f, &scan, image->pixelFormat());
       }
       else {
         // Width and height
@@ -1339,6 +1375,12 @@ static void ase_file_write_external_files_chunk(
     putExtentionIds(slice->userData().propertiesMaps(), ext_files);
   }
 
+  // Tile management plugin
+  if (sprite->hasTileManagementPlugin()) {
+    ext_files.insert(ASE_EXTERNAL_FILE_TILE_MANAGEMENT,
+                     sprite->tileManagementPlugin());
+  }
+
   // No external files to write
   if (ext_files.items().empty())
     return;
@@ -1423,14 +1465,43 @@ static void ase_file_write_tileset_chunk(FILE* f, FileOp* fop,
   // Flag 2 = tileset
   if (flags & ASE_TILESET_FLAG_EMBEDDED) {
     size_t beg = ftell(f);
-    fputl(0, f);                  // Field for compressed data length (completed later)
-    TilesetScanlines gen(tileset);
-    write_compressed_image(f, &gen, tileset->sprite()->pixelFormat());
 
-    size_t end = ftell(f);
-    fseek(f, beg, SEEK_SET);
-    fputl(end-beg-4, f);          // Save the compressed data length
-    fseek(f, end, SEEK_SET);
+    // Save the cached tileset compressed data
+    if (!tileset->compressedData().empty() &&
+        tileset->compressedDataVersion() == tileset->version()) {
+      const base::buffer& data = tileset->compressedData();
+
+      ASEFILE_TRACE("[%d] saving compressed tileset (%s)\n",
+                    tileset->id(), base::get_pretty_memory_size(data.size()).c_str());
+
+      fputl(data.size(), f); // Compressed data length
+      fwrite(&data[0], 1, data.size(), f);
+    }
+    // Compress and save the tileset now
+    else {
+      fputl(0, f);                  // Field for compressed data length (completed later)
+      TilesetScanlines gen(tileset);
+
+      ASEFILE_TRACE("[%d] recompressing tileset\n", tileset->id());
+
+      base::buffer compressedData;
+      base::buffer* compressedDataPtr = nullptr;
+      if (fop->config().cacheCompressedTilesets)
+        compressedDataPtr = &compressedData;
+
+      write_compressed_image(f, &gen, tileset->sprite()->pixelFormat(),
+                             compressedDataPtr);
+
+      // As we've just compressed the tileset, we can cache this same
+      // data (so saving the file again will not need recompressing).
+      if (compressedDataPtr)
+        tileset->setCompressedData(compressedData);
+
+      size_t end = ftell(f);
+      fseek(f, beg, SEEK_SET);
+      fputl(end-beg-4, f);          // Save the compressed data length
+      fseek(f, end, SEEK_SET);
+    }
   }
 }
 
